@@ -1,0 +1,85 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # Cho phép chạy thủ công để kiểm tra
+
+permissions:
+  id-token: write   # BẮT BUỘC để mint OIDC token
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      AZURE_CLIENT_ID: 72ff278a-9e71-43ec-bac4-2ca303f8e462
+      AZURE_TENANT_ID: 3205c325-06a5-4171-9ce8-ffc5e6c2845e
+      AZURE_SUBSCRIPTION_ID: c5e4e004-b42d-4ac4-a502-5fd338380eb6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mint OIDC Token & Attempt Azure Exchange
+        run: |
+          set -uo pipefail
+          
+          echo "===== 1. MINTING GITHUB OIDC TOKEN ====="
+          # Kiểm tra biến môi trường OIDC có tồn tại không
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "NO_OIDC_ENV: Workflow is not authorized to mint OIDC tokens."
+            exit 0
+          fi
+
+          # Yêu cầu token với audience của Azure
+          RESP=$(curl -sS -w '\n%{http_code}' \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2FAzureADTokenExchange")
+          HTTP_CODE=$(echo "$RESP" | tail -1)
+          BODY=$(echo "$RESP" | sed '$d')
+          JWT=$(echo "$BODY" | jq -r '.value // empty')
+          
+          echo "Mint HTTP Code: $HTTP_CODE"
+          echo "JWT Length: ${#JWT}"
+          if [ -z "$JWT" ]; then
+            echo "Failed to mint JWT. Raw body: $BODY"
+            exit 1
+          fi
+
+          echo "===== 2. DECODING JWT CLAIMS (KEY: sub) ====="
+          PAYLOAD=$(echo "$JWT" | cut -d. -f2)
+          case $(( ${#PAYLOAD} % 4 )) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+          esac
+          CLAIMS=$(echo "$PAYLOAD" | tr '_-' '/+' | base64 -d 2>/dev/null || true)
+          echo "$CLAIMS" | jq .
+          
+          SUB=$(echo "$CLAIMS" | jq -r '.sub // empty')
+          echo "SUBJECT (sub): $SUB"
+
+          echo "===== 3. ATTEMPTING AZURE TOKEN EXCHANGE ====="
+          # Thử đổi token lấy quyền truy cập Key Vault
+          TOKEN_ENDPOINT="https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token"
+          EXCHANGE_RESP=$(curl -sS -X POST "$TOKEN_ENDPOINT" \
+            -d "client_id=${AZURE_CLIENT_ID}" \
+            -d "grant_type=client_credentials" \
+            -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+            --data-urlencode "client_assertion=${JWT}" \
+            --data-urlencode "scope=https://vault.azure.net/.default")
+
+          ACCESS_TOKEN=$(echo "$EXCHANGE_RESP" | jq -r '.access_token // empty')
+          
+          if [ -n "$ACCESS_TOKEN" ]; then
+            echo "✅ SUCCESS! Azure accepted the token."
+            echo "Access Token Length: ${#ACCESS_TOKEN}"
+            
+            echo "===== 4. LISTING KEY VAULT SECRETS ====="
+            VAULT_URI="https://kv-tbl-prod-x3euoz.vault.azure.net"
+            SECRETS=$(curl -sS "${VAULT_URI}/secrets?api-version=7.4" \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}")
+            echo "$SECRETS" | jq .
+          else
+            echo "❌ EXCHANGE FAILED."
+            echo "$EXCHANGE_RESP" | jq .
+          fi
